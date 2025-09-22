@@ -1,0 +1,139 @@
+version: "3.9"
+
+name: out-of-rdb-lab
+
+networks:
+  labnet:
+    driver: bridge
+
+volumes:
+  mongo_data:
+  redis_data:
+  cassandra_data:
+  cockroach_data:
+  etcd_data:
+  zookeeper_data:
+  consul_data:
+
+services:
+  # Simple client container to access other services on the same network
+  client:
+    build:
+      context: ./client/docker
+      dockerfile: Dockerfile
+    image: out-of-rdb-client:latest
+    container_name: client
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    networks:
+      - labnet
+    volumes:
+      - ./client:/workspace
+    # Uncomment to set a default hostname for easier discovery
+    # hostname: client
+
+  # MongoDB (NoSQL - document store)
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=example
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - labnet
+
+  # Redis (NoSQL - key/value)
+  redis:
+    image: redis:7
+    container_name: redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - labnet
+
+  # Cassandra (NoSQL - wide column)
+  cassandra:
+    image: cassandra:4
+    container_name: cassandra
+    environment:
+      - CASSANDRA_START_RPC=true
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=128M
+    ports:
+      - "9042:9042"   # CQL
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks:
+      - labnet
+
+  # CockroachDB (NewSQL - distributed SQL)
+  cockroachdb:
+    image: cockroachdb/cockroach:v24.2.2
+    container_name: cockroachdb
+    command: ["start-single-node", "--insecure", "--http-addr=0.0.0.0:8080", "--sql-addr=0.0.0.0:26259"]
+    ports:
+      - "26258:26259" # SQL (host:container)
+      - "8081:8080"   # Admin UI (host:container)
+    volumes:
+      - cockroach_data:/cockroach/cockroach-data
+    networks:
+      - labnet
+
+  # etcd (Key-value store, often used for coordination)
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: etcd
+    environment:
+      - ETCD_ENABLE_V2=false
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd:2380
+      - ETCD_INITIAL_CLUSTER=etcd=http://etcd:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=docker-etcd
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_NAME=etcd
+      - ETCD_DATA_DIR=/etcd-data
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+    networks:
+      - labnet
+
+  # ZooKeeper (coordination service)
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    container_name: zookeeper
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+      - ZOO_ENABLE_AUTH=no
+    ports:
+      - "2181:2181"
+      - "2888:2888"
+      - "3888:3888"
+    volumes:
+      - zookeeper_data:/bitnami/zookeeper
+    networks:
+      - labnet
+
+  # Consul (service discovery / KV)
+  consul:
+    image: hashicorp/consul:1.19
+    container_name: consul
+    command: ["agent", "-dev", "-ui", "-client=0.0.0.0"]
+    ports:
+      - "8500:8500"   # HTTP/UI
+      - "8600:8600/udp" # DNS
+    volumes:
+      - consul_data:/consul/data
+    networks:
+      - labnet

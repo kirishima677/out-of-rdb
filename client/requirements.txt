@@ -1,0 +1,7 @@
+redis
+pymongo
+cassandra-driver
+psycopg2-binary
+etcd3
+python-consul
+kazoo
