@@ -1,4 +1,29 @@
+
 ### out-of-rdb-lab
+
+## Supported Databases
+
+| Category | Database | Python | Go |
+|----------|----------|:------:|:--:|
+| Document | MongoDB | ✅ | ✅ |
+| Key-Value | Redis | ✅ | ✅ |
+| Wide Column | Cassandra | ✅ | ✅ |
+| Column-Oriented | ClickHouse | ✅ | ✅ |
+| Graph | Neo4j | ✅ | ✅ |
+| NewSQL | CockroachDB | ✅ | ✅ |
+| Distributed KV | etcd | ✅ | ✅ |
+| Service Discovery | Consul | ✅ | ✅ |
+| Coordination | ZooKeeper | ✅ | ✅ |
+
+**Features**
+
+- Docker Compose によるワンコマンド起動
+- Python / Go の接続サンプルを同梱
+- 同一データモデルを複数のデータベースで比較可能
+- Docker ネットワーク内・ホスト環境の両方から接続可能
+- データベース学習・検証・比較を目的とした実験環境
+
+---
 
 複数の NoSQL / NewSQL を Docker Compose で立ち上げ、1つの `client` コンテナから接続検証できる実験用リポジトリです。Python / Go の接続サンプルを同梱しています。
 
@@ -9,8 +34,10 @@
 - クライアント: `client`（Python3, Go 1.23, ビルド環境・CA 証明書入り）
 - ミドルウェア（独立コンテナ）
   - MongoDB (`mongodb:27017`, 認証: root/example)
-  - Redis (`redis:6379`)
+  - Redis（コンテナ: `redis:6379` / ホスト: `localhost:6381`）
   - Cassandra (`cassandra:9042`)
+  - ClickHouse (`clickhouse:9000` Native, `clickhouse:8123` HTTP)
+  - Neo4j (`neo4j:7687` Bolt, Browser: `localhost:7474`)
   - CockroachDB (`cockroachdb:26259` コンテナ内、ホスト 26258→26259 マッピング, Admin UI: host 8081)
   - etcd (`etcd:2379`)
   - ZooKeeper (`zookeeper:2181`)
@@ -47,6 +74,8 @@ pip install -r /workspace/requirements.txt
   - 例: `python /workspace/sample/mongo_db_sample.py`
   - 例: `python /workspace/sample/cassandra_sample.py`
   - 例: `python /workspace/sample/consul_sample.py`
+  - 例: `python /workspace/sample/clickhouse_sample.py`
+  - 例: `python /workspace/sample/neo4j_sample.py`
 
 ### Go（モジュール準備）
 ```bash
@@ -61,13 +90,17 @@ go mod tidy
   - 例: `go run etcd.go`
   - 例: `go run zookeeper.go`
   - 例: `go run consul.go`
+  - 例: `go run clickhouse.go`
+  - 例: `go run neo4j.go`
 
 ---
 
 ### 主な接続情報（client からの接続先）
 - MongoDB: `mongodb:27017`（URI 例: `mongodb://root:example@mongodb:27017/?authSource=admin`）
-- Redis: `redis:6379`
+- Redis: `redis:6379`（ホストからは `localhost:6381`）
 - Cassandra: `cassandra:9042`
+- ClickHouse: Native `clickhouse:9000` / HTTP `http://clickhouse:8123`
+- Neo4j: Bolt `neo4j:7687`（Browser: `http://localhost:7474`）
 - CockroachDB: `cockroachdb:26259`（ホストからは `localhost:26258`）
 - etcd: `http://etcd:2379`
 - ZooKeeper: `zookeeper:2181`

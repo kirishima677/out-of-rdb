@@ -10,7 +10,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	client := redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	client := redis.NewClient(&redis.Options{Addr: "redis:6381"})
 	defer client.Close()
 
 	if err := client.Set(ctx, "hello", "world", time.Minute).Err(); err != nil {
