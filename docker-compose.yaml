@@ -18,6 +18,8 @@ volumes:
   neo4j_logs:
   neo4j_plugins:
   dynamodb_data:
+  localstack_data:
+  fluentbit_data:
 
 services:
   # Simple client container to access other services on the same network
@@ -184,5 +186,43 @@ services:
       - "8000:8000"
     volumes:
       - dynamodb_data:/home/dynamodblocal/data
+    networks:
+      - labnet
+
+  # Local AWS emulator: S3 events can invoke Lambda functions in Docker.
+  localstack:
+    # Pin a Community-compatible release; newer `latest` images may require activation.
+    image: localstack/localstack:3.8.1
+    container_name: localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,lambda,iam,logs,sts
+      DEFAULT_REGION: us-east-1
+      DEBUG: "0"
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # Lambda containers need this Compose network to reach other local services.
+      LAMBDA_DOCKER_NETWORK: out-of-rdb-lab_labnet
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - labnet
+
+  # Emits one sample log record to LocalStack S3 after LocalStack is ready.
+  fluentbit:
+    image: fluent/fluent-bit:3.2
+    container_name: fluentbit
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - fluentbit_data:/buffers
     networks:
       - labnet

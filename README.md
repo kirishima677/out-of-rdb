@@ -7,6 +7,7 @@
 |----------|----------|:------:|:--:|
 | Document | MongoDB | ✅ | ✅ |
 | Key-Value / Document | DynamoDB Local | ✅ | ✅ |
+| AWS Emulator | LocalStack (S3 / Lambda) | ✅ | ✅ |
 | Key-Value | Redis | ✅ | ✅ |
 | Wide Column | Cassandra | ✅ | ✅ |
 | Column-Oriented | ClickHouse | ✅ | ✅ |
@@ -36,6 +37,7 @@
 - ミドルウェア（独立コンテナ）
   - MongoDB (`mongodb:27017`, 認証: root/example)
   - DynamoDB Local (`dynamodb:8000`, ホスト: `localhost:8000`)
+  - LocalStack (`localstack:4566`, ホスト: `localhost:4566`; S3 / Lambda / IAM / Logs / STS)
   - Redis（コンテナ: `redis:6379` / ホスト: `localhost:6381`）
   - Cassandra (`cassandra:9042`)
   - ClickHouse (`clickhouse:9000` Native, `clickhouse:8123` HTTP)
@@ -102,6 +104,26 @@ go mod tidy
 ### 主な接続情報（client からの接続先）
 - MongoDB: `mongodb:27017`（URI 例: `mongodb://root:example@mongodb:27017/?authSource=admin`）
 - DynamoDB Local: `http://dynamodb:8000`（ホストからは `http://localhost:8000`、AWS認証情報は任意のダミー値で可）
+- LocalStack: `http://localstack:4566`（ホストからは `http://localhost:4566`、AWS SDK にはダミー認証情報と `endpoint_url` を設定）
+
+### Fluent Bit → S3 → Lambda サンプル
+
+詳細な構成・操作・動作原理は [Fluent Bit → S3 → Lambda → DynamoDB Local サンプル](docs/fluentbit-s3-lambda-localstack.md) を参照してください。
+
+`docker compose up -d` 後、`fluentbit` は1件のダミーログを LocalStack S3 の `fluentbit-logs` バケットへ配送します。S3 の `ObjectCreated` イベントで Lambda `process-fluentbit-log` が起動し、読み込んだ行数を DynamoDB Local の `processed_logs` テーブルへ保存します。
+
+```bash
+# 配送・Lambda 実行のログ
+docker compose logs -f fluentbit localstack
+
+# 作成された S3 オブジェクトを確認
+docker exec localstack awslocal s3 ls s3://fluentbit-logs --recursive
+
+# Lambda による処理結果を確認
+docker exec localstack awslocal dynamodb scan --endpoint-url http://dynamodb:8000 --table-name processed_logs
+```
+
+> `processed_logs` は既存の DynamoDB Local にあります。LocalStack コンテナから接続するための `--endpoint-url http://dynamodb:8000` を付けています。
 - Redis: `redis:6379`（ホストからは `localhost:6381`）
 - Cassandra: `cassandra:9042`
 - ClickHouse: Native `clickhouse:9000` / HTTP `http://clickhouse:8123`
@@ -118,6 +140,7 @@ go mod tidy
 - Python の PEP 668: システム Python は触らず、仮想環境（venv）にインストールしてください。
 - Cassandra Python ドライバ: `python3-dev`, `libev-dev` などが必要で、イメージに同梱済み。ビルドし直した場合は venv 内で `cassandra-driver` を入れ直してください。
 - Go モジュール解決: `go mod tidy` 実行。CA 証明書・`GOPROXY` は client で設定済み。
+- LocalStack の Lambda: LocalStack が Lambda 実行用コンテナを起動するため、Compose では Docker ソケットを共有しています。ローカル開発用途に限定してください。
 
 ---
 
