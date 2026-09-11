@@ -17,6 +17,9 @@ go run mongo.go
 # Redis
 go run redis.go
 
+# DynamoDB Local
+go run dynamodb.go
+
 # Cassandra
 go run cassandra.go
 

@@ -17,6 +17,7 @@ volumes:
   neo4j_data:
   neo4j_logs:
   neo4j_plugins:
+  dynamodb_data:
 
 services:
   # Simple client container to access other services on the same network
@@ -169,5 +170,19 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
       - neo4j_plugins:/plugins
+    networks:
+      - labnet
+
+  # DynamoDB Local (AWS DynamoDB-compatible local development database)
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb
+    # Named volumes are root-owned when first created; DynamoDB Local needs write access.
+    user: "0:0"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - dynamodb_data:/home/dynamodblocal/data
     networks:
       - labnet

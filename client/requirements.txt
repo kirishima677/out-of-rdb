@@ -5,3 +5,4 @@ psycopg2-binary
 etcd3
 python-consul
 kazoo
+boto3

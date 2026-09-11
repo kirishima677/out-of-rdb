@@ -6,6 +6,7 @@
 | Category | Database | Python | Go |
 |----------|----------|:------:|:--:|
 | Document | MongoDB | ✅ | ✅ |
+| Key-Value / Document | DynamoDB Local | ✅ | ✅ |
 | Key-Value | Redis | ✅ | ✅ |
 | Wide Column | Cassandra | ✅ | ✅ |
 | Column-Oriented | ClickHouse | ✅ | ✅ |
@@ -34,6 +35,7 @@
 - クライアント: `client`（Python3, Go 1.23, ビルド環境・CA 証明書入り）
 - ミドルウェア（独立コンテナ）
   - MongoDB (`mongodb:27017`, 認証: root/example)
+  - DynamoDB Local (`dynamodb:8000`, ホスト: `localhost:8000`)
   - Redis（コンテナ: `redis:6379` / ホスト: `localhost:6381`）
   - Cassandra (`cassandra:9042`)
   - ClickHouse (`clickhouse:9000` Native, `clickhouse:8123` HTTP)
@@ -76,6 +78,7 @@ pip install -r /workspace/requirements.txt
   - 例: `python /workspace/sample/consul_sample.py`
   - 例: `python /workspace/sample/clickhouse_sample.py`
   - 例: `python /workspace/sample/neo4j_sample.py`
+  - 例: `python /workspace/sample/dynamodb_sample.py`
 
 ### Go（モジュール準備）
 ```bash
@@ -92,11 +95,13 @@ go mod tidy
   - 例: `go run consul.go`
   - 例: `go run clickhouse.go`
   - 例: `go run neo4j.go`
+  - 例: `go run dynamodb.go`
 
 ---
 
 ### 主な接続情報（client からの接続先）
 - MongoDB: `mongodb:27017`（URI 例: `mongodb://root:example@mongodb:27017/?authSource=admin`）
+- DynamoDB Local: `http://dynamodb:8000`（ホストからは `http://localhost:8000`、AWS認証情報は任意のダミー値で可）
 - Redis: `redis:6379`（ホストからは `localhost:6381`）
 - Cassandra: `cassandra:9042`
 - ClickHouse: Native `clickhouse:9000` / HTTP `http://clickhouse:8123`

@@ -35,6 +35,9 @@ python /workspace/sample/mongo_db_sample.py
 # Redis
 python /workspace/sample/redis_connect_sample.py
 
+# DynamoDB Local
+python /workspace/sample/dynamodb_sample.py
+
 # Cassandra
 python /workspace/sample/cassandra_sample.py
 
