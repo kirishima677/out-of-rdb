@@ -38,6 +38,12 @@ python /workspace/sample/redis_connect_sample.py
 # DynamoDB Local
 python /workspace/sample/dynamodb_sample.py
 
+# DynamoDB Local: メール重複検知の履歴を表示
+python /workspace/sample/show_mail_duplicate_events.py
+
+# 指定した EmailID の履歴だけを表示
+python /workspace/sample/show_mail_duplicate_events.py --email-id 900001
+
 # Cassandra
 python /workspace/sample/cassandra_sample.py
 

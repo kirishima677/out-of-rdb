@@ -1,6 +1,10 @@
 
 ### out-of-rdb-lab
 
+### コメントの記述方針
+
+このリポジトリで新規追加・更新するソースコードのコメントと docstring は、原則として英語と日本語を併記します。コードの動作に直接関係しない短い定型コメントや、外部ツールが要求する記述は例外です。
+
 ## Supported Databases
 
 | Category | Database | Python | Go |
@@ -124,6 +128,18 @@ docker exec localstack awslocal dynamodb scan --endpoint-url http://dynamodb:800
 ```
 
 > `processed_logs` は既存の DynamoDB Local にあります。LocalStack コンテナから接続するための `--endpoint-url http://dynamodb:8000` を付けています。
+
+### OAメール送信側重複検知サンプル
+
+`mail-send-logs` へ保存したメール送信ログから、同じ `EmailID` の送信成功を直近1時間で検知する Lambda も追加しています。Slackは送信せず、検知内容を Lambda ログへ出力します。詳細は [OAメール送信側重複検知 Lambda](docs/mail-duplicate-detector.md) を参照してください。
+
+ローカル動作確認は `./scripts/test-mail-duplicate-detector.sh` で実行できます。
+
+100件の処理時間を測る場合は `./scripts/benchmark-mail-duplicate-detector.sh` を実行します。
+
+100件を0.5秒差で二重配送する検証は `./scripts/test-mail-duplicate-concurrent.sh` を実行します。
+
+Slack 成功・失敗・段階的復旧を再現する API は [LocalStack 疑似 Slack API](docs/mock-slack-api.md) を参照してください。
 - Redis: `redis:6379`（ホストからは `localhost:6381`）
 - Cassandra: `cassandra:9042`
 - ClickHouse: Native `clickhouse:9000` / HTTP `http://clickhouse:8123`

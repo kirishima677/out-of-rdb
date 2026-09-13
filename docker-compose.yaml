@@ -190,18 +190,21 @@ services:
       - labnet
 
   # Local AWS emulator: S3 events can invoke Lambda functions in Docker.
+  # ローカル AWS エミュレータ。Docker 内で S3 イベントから Lambda を起動できる。
   localstack:
     # Pin a Community-compatible release; newer `latest` images may require activation.
+    # Community 互換のバージョンに固定する。新しい `latest` は有効化が必要なことがある。
     image: localstack/localstack:3.8.1
     container_name: localstack
     ports:
       - "4566:4566"
     environment:
-      SERVICES: s3,lambda,iam,logs,sts
+      SERVICES: s3,lambda,iam,logs,sts,apigateway
       DEFAULT_REGION: us-east-1
       DEBUG: "0"
       DOCKER_HOST: unix:///var/run/docker.sock
       # Lambda containers need this Compose network to reach other local services.
+      # Lambda コンテナが他のローカルサービスへ到達するための Compose ネットワーク。
       LAMBDA_DOCKER_NETWORK: out-of-rdb-lab_labnet
     volumes:
       - localstack_data:/var/lib/localstack
@@ -211,6 +214,7 @@ services:
       - labnet
 
   # Emits one sample log record to LocalStack S3 after LocalStack is ready.
+  # LocalStack の起動完了後、サンプルログを 1 件 S3 に配送する。
   fluentbit:
     image: fluent/fluent-bit:3.2
     container_name: fluentbit
