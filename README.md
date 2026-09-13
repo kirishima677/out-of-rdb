@@ -140,6 +140,8 @@ docker exec localstack awslocal dynamodb scan --endpoint-url http://dynamodb:800
 100件を0.5秒差で二重配送する検証は `./scripts/test-mail-duplicate-concurrent.sh` を実行します。
 
 Slack 成功・失敗・段階的復旧を再現する API は [LocalStack 疑似 Slack API](docs/mock-slack-api.md) を参照してください。
+
+構成、実装済み範囲、テストパターン、次の拡張候補は [OAメール送信側重複検知: 現状整理](docs/mail-duplicate-detector-overview.md) にまとめています。
 - Redis: `redis:6379`（ホストからは `localhost:6381`）
 - Cassandra: `cassandra:9042`
 - ClickHouse: Native `clickhouse:9000` / HTTP `http://clickhouse:8123`
