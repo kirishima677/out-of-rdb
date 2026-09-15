@@ -11,7 +11,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-TABLE_NAME = "mail_duplicate_events"
+TABLE_NAME = os.environ.get("TABLE_NAME", "mail_send_log_events")
 DEFAULT_ENDPOINT = "http://dynamodb:8000"
 
 
@@ -42,9 +42,13 @@ def main():
     for item in items:
         print("-" * 72)
         print(f"EmailID    : {item['EmailID']}")
-        print(f"DetectedAt : {item['createdAt']}")
+        print(f"CreatedAt  : {item['createdAt']}")
+        print(f"RecordKey  : {item['recordKey']}")
+        print(f"LogAt      : {item.get('logTimestamp', '-')}")
+        print(f"Command    : {item.get('command', '-')}")
+        print(f"Host       : {item.get('sourceHost', '-')}")
         print(f"ExpiresAt  : {_format_epoch(item.get('expiresAt'))}")
-        print(f"Source     : s3://{item.get('sourceBucket', '?')}/{item.get('sourceKey', '?')}")
+        print(f"Source     : s3://{item.get('sourceBucket', '?')}/{item.get('sourceKey', '?')}:{item.get('sourceLineNumber', '?')}")
 
 
 def _parse_args():
@@ -53,7 +57,7 @@ def _parse_args():
     ローカル確認用の任意フィルターを解析する。
     """
     parser = argparse.ArgumentParser(
-        description="Show records in DynamoDB Local mail_duplicate_events."
+        description="Show records in DynamoDB Local mail_send_log_events."
     )
     parser.add_argument(
         "--email-id", help="Show only records for this EmailID.（指定した EmailID のみ表示）"
@@ -88,10 +92,20 @@ def _read_items(table, email_id):
     EmailID 指定時は Query、それ以外はローカルテーブルを Scan する。
     """
     if email_id:
-        return table.query(
-            KeyConditionExpression=Key("EmailID").eq(email_id),
-            ConsistentRead=True,
-        )["Items"]
+        # EmailID はベーステーブルのパーティションキーなので GSI を経由しない。
+        # 主キー経由なので ConsistentRead=True を指定でき、検知側と同じ見え方になる。
+        items = []
+        kwargs = {
+            "KeyConditionExpression": Key("EmailID").eq(email_id),
+            "ConsistentRead": True,
+        }
+        while True:
+            response = table.query(**kwargs)
+            items.extend(response["Items"])
+            start_key = response.get("LastEvaluatedKey")
+            if not start_key:
+                return items
+            kwargs["ExclusiveStartKey"] = start_key
 
     items = []
     response = table.scan(ConsistentRead=True)
