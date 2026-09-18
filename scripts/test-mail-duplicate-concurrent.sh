@@ -9,11 +9,28 @@ RECORD_COUNT="${RECORD_COUNT:-100}"
 DELAY_SECONDS="${DELAY_SECONDS:-0.5}"
 KEEP_TEST_DATA="${KEEP_TEST_DATA:-0}"
 BUCKET="mail-send-logs"
-TABLE="mail_duplicate_events"
+# Match the detector's table name so tests target the same environment.
+# 検知側のテーブル名に合わせ、テストが同じ環境を対象にするようにする。
+TABLE="$(docker exec "${LOCALSTACK_CONTAINER}" awslocal lambda get-function \
+  --function-name detect-mail-duplicates \
+  --query 'Configuration.Environment.Variables.TABLE_NAME' \
+  --output text 2>/dev/null || echo '')"
+if [ -z "${TABLE}" ] || [ "${TABLE}" = "None" ]; then
+  TABLE="mail_send_log_events"
+fi
 # Numeric IDs satisfy the current detector pattern and are unique per test run.
 # 数値 ID は現在の検知パターンに合い、テスト実行ごとに一意となる。
 RUN_ID="$(date +%s)$$"
-KEY_PREFIX="concurrent/${RUN_ID}"
+# Match the detector's prefix filter so test objects are not skipped.
+# 検知側のプレフィックスフィルタに合わせ、テスト用オブジェクトが無視されないようにする。
+DETECTOR_KEY_PREFIX="$(docker exec "${LOCALSTACK_CONTAINER}" awslocal lambda get-function \
+  --function-name detect-mail-duplicates \
+  --query 'Configuration.Environment.Variables.TARGET_KEY_PREFIX' \
+  --output text 2>/dev/null || echo '')"
+if [ "${DETECTOR_KEY_PREFIX}" = "None" ]; then
+  DETECTOR_KEY_PREFIX=""
+fi
+KEY_PREFIX="${DETECTOR_KEY_PREFIX}concurrent/${RUN_ID}"
 FIRST_KEY="${KEY_PREFIX}/mail-send-1.log"
 SECOND_KEY="${KEY_PREFIX}/mail-send-2.log"
 SLACK_WEBHOOK_URL="$(docker exec "${LOCALSTACK_CONTAINER}" awslocal lambda get-function \
@@ -40,7 +57,8 @@ cleanup() {
   # この実行の sourceKey を持つレコードだけを削除する。
   docker exec "${LOCALSTACK_CONTAINER}" awslocal s3 rm "s3://${BUCKET}/${FIRST_KEY}" >/dev/null 2>&1 || true
   docker exec "${LOCALSTACK_CONTAINER}" awslocal s3 rm "s3://${BUCKET}/${SECOND_KEY}" >/dev/null 2>&1 || true
-  docker exec -i "${LOCALSTACK_CONTAINER}" python3 - "${KEY_PREFIX}/" <<'PY' >/dev/null 2>&1 || true
+  docker exec -i -e TABLE_NAME="${TABLE}" "${LOCALSTACK_CONTAINER}" python3 - "${KEY_PREFIX}/" <<'PY' >/dev/null 2>&1 || true
+import os
 import sys
 
 import boto3
@@ -52,7 +70,7 @@ table = boto3.resource(
     region_name="us-east-1",
     aws_access_key_id="local",
     aws_secret_access_key="local",
-).Table("mail_duplicate_events")
+).Table(os.environ["TABLE_NAME"])
 
 response = table.scan(FilterExpression=Attr("sourceKey").begins_with(sys.argv[1]))
 items = response["Items"]
@@ -65,7 +83,7 @@ while "LastEvaluatedKey" in response:
 
 with table.batch_writer() as batch:
     for item in items:
-        batch.delete_item(Key={"EmailID": item["EmailID"], "createdAt": item["createdAt"]})
+        batch.delete_item(Key={"EmailID": item["EmailID"], "recordKey": item["recordKey"]})
 PY
   # Remove mock delivery counters created by this test as well.
   # このテストで作られた疑似 Slack の配送カウンターも削除する。
@@ -75,7 +93,8 @@ PY
 wait_for_and_verify_records() {
   attempt=1
   while [ "${attempt}" -le 30 ]; do
-    if docker exec -i "${LOCALSTACK_CONTAINER}" python3 - "${KEY_PREFIX}/" "${RECORD_COUNT}" <<'PY'
+    if docker exec -i -e TABLE_NAME="${TABLE}" "${LOCALSTACK_CONTAINER}" python3 - "${KEY_PREFIX}/" "${RECORD_COUNT}" <<'PY'
+import os
 import sys
 from collections import Counter
 
@@ -89,7 +108,7 @@ table = boto3.resource(
     region_name="us-east-1",
     aws_access_key_id="local",
     aws_secret_access_key="local",
-).Table("mail_duplicate_events")
+).Table(os.environ["TABLE_NAME"])
 
 response = table.scan(FilterExpression=Attr("sourceKey").begins_with(source_prefix))
 items = response["Items"]
@@ -137,10 +156,12 @@ record_count="$2"
 for file_number in 1 2; do
   file="/tmp/mail-duplicate-concurrent-${file_number}.log"
   : > "${file}"
+  iso_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  log_timestamp="$(date -u '+%Y-%m-%d %H:%M:%S')"
   index=1
   while [ "${index}" -le "${record_count}" ]; do
     email_id="${run_id}$(printf '%03d' "${index}")"
-    printf '%s\n' "[2026-09-13 10:00:00] production.INFO: SendEmails [production] success  sending email: ${email_id}" >> "${file}"
+    printf '{"date":"%s","log":"[%s] production.INFO: SendEmails [production] success  sending email: %s"}\n' "$iso_timestamp" "$log_timestamp" "$email_id" >> "${file}"
     index=$((index + 1))
   done
 done

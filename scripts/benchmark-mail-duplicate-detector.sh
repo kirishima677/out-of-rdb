@@ -8,11 +8,28 @@ LOCALSTACK_CONTAINER="${LOCALSTACK_CONTAINER:-localstack}"
 RECORD_COUNT="${RECORD_COUNT:-100}"
 KEEP_TEST_DATA="${KEEP_TEST_DATA:-0}"
 BUCKET="mail-send-logs"
-TABLE="mail_duplicate_events"
+# Match the detector's table name so tests target the same environment.
+# 検知側のテーブル名に合わせ、テストが同じ環境を対象にするようにする。
+TABLE="$(docker exec "${LOCALSTACK_CONTAINER}" awslocal lambda get-function \
+  --function-name detect-mail-duplicates \
+  --query 'Configuration.Environment.Variables.TABLE_NAME' \
+  --output text 2>/dev/null || echo '')"
+if [ -z "${TABLE}" ] || [ "${TABLE}" = "None" ]; then
+  TABLE="mail_send_log_events"
+fi
 # Create numeric IDs so they match the detector's current EmailID pattern.
 # 現在の検知正規表現に合うよう、数値の EmailID を作る。
 RUN_ID="$(date +%s)$$"
-OBJECT_KEY="benchmark/${RUN_ID}/mail-send-${RECORD_COUNT}.log"
+# Match the detector's prefix filter so test objects are not skipped.
+# 検知側のプレフィックスフィルタに合わせ、テスト用オブジェクトが無視されないようにする。
+DETECTOR_KEY_PREFIX="$(docker exec "${LOCALSTACK_CONTAINER}" awslocal lambda get-function \
+  --function-name detect-mail-duplicates \
+  --query 'Configuration.Environment.Variables.TARGET_KEY_PREFIX' \
+  --output text 2>/dev/null || echo '')"
+if [ "${DETECTOR_KEY_PREFIX}" = "None" ]; then
+  DETECTOR_KEY_PREFIX=""
+fi
+OBJECT_KEY="${DETECTOR_KEY_PREFIX}benchmark/${RUN_ID}/mail-send-${RECORD_COUNT}.log"
 
 case "${RECORD_COUNT}" in
   ''|*[!0-9]*|0)
@@ -34,7 +51,8 @@ cleanup() {
 
   # Batch-delete by sourceKey to avoid one Docker process per record.
   # レコードごとに Docker プロセスを作らないよう、sourceKey 単位で一括削除する。
-  docker exec -i "${LOCALSTACK_CONTAINER}" python3 - "${OBJECT_KEY}" <<'PY' >/dev/null 2>&1 || true
+  docker exec -i -e TABLE_NAME="${TABLE}" "${LOCALSTACK_CONTAINER}" python3 - "${OBJECT_KEY}" <<'PY' >/dev/null 2>&1 || true
+import os
 import sys
 
 import boto3
@@ -46,7 +64,7 @@ table = boto3.resource(
     region_name="us-east-1",
     aws_access_key_id="local",
     aws_secret_access_key="local",
-).Table("mail_duplicate_events")
+).Table(os.environ["TABLE_NAME"])
 
 response = table.scan(FilterExpression=Attr("sourceKey").eq(sys.argv[1]))
 items = response["Items"]
@@ -59,7 +77,7 @@ while "LastEvaluatedKey" in response:
 
 with table.batch_writer() as batch:
     for item in items:
-        batch.delete_item(Key={"EmailID": item["EmailID"], "createdAt": item["createdAt"]})
+        batch.delete_item(Key={"EmailID": item["EmailID"], "recordKey": item["recordKey"]})
 PY
 }
 
@@ -98,10 +116,12 @@ record_count="$2"
 object_key="$3"
 
 : > /tmp/mail-duplicate-benchmark.log
+iso_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+log_timestamp="$(date -u '+%Y-%m-%d %H:%M:%S')"
 index=1
 while [ "${index}" -le "${record_count}" ]; do
   email_id="${run_id}$(printf '%03d' "${index}")"
-  printf '%s\n' "[2026-09-13 10:00:00] production.INFO: SendEmails [production] success  sending email: ${email_id}" >> /tmp/mail-duplicate-benchmark.log
+  printf '{"date":"%s","log":"[%s] production.INFO: SendEmails [production] success  sending email: %s"}\n' "$iso_timestamp" "$log_timestamp" "$email_id" >> /tmp/mail-duplicate-benchmark.log
   index=$((index + 1))
 done
 awslocal s3 cp /tmp/mail-duplicate-benchmark.log "s3://mail-send-logs/${object_key}"
