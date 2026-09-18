@@ -7,17 +7,23 @@
 - 対象コマンドは `EvenSendEmails`、`OddSendEmails`、`SendEmails`
 - `success sending email: <EmailID>` を含むログ行だけを対象にする
 - `failed sending email:` を含む失敗ログは正規表現に一致しないため対象外
-- `EmailID` ごとに、Lambda が検知した現在時刻を `createdAt` として DynamoDB Local の `mail_duplicate_events` テーブルへ記録する
-- `createdAt` が直近1時間の同一 `EmailID` を強整合性読み取りで数え、2件以上で Lambda ログへ通知内容を出す
-- 同じS3オブジェクト内に同じ `EmailID` が3件以上あっても、Lambdaの1回の実行につき通知は1回だけ
+- ログ1行につき1レコードを DynamoDB Local の `mail_send_log_events` テーブルへ記録する。`EmailID` をパーティションキー、`{createdAt}#{sourceKey}#{行番号}` をソートキーとする複合キーで、同じ `EmailID` の出現が上書きされず別レコードとして積み上がる。`logTimestamp`、コマンド、S3入力元、生ログも属性として保持する
+- `expiresAt` を DynamoDB TTL 属性として有効化し、検知時刻から1時間後を削除対象にする。TTL削除は非同期で最大48時間遅れるため、判定は TTL ではなく `createdAt` の時刻条件で行う
+- `EmailID` を指定したベーステーブルの `Query`（`ConsistentRead=true`）で直近1時間の同一 ID を数え、2件以上で重複と判定する。**GSI は使わない**。GSI は仕様上 `ConsistentRead` を指定できず、書き込み直後のレコードが検索に載らないため
+- Slack には個別 EmailID を全件列挙せず、今回の Lambda 実行で検知した重複件数と、`EmailID` あたりの最多件数を通知する
 
-`SLACK_WEBHOOK_URL` が設定されている場合、`_notify_duplicate` は Lambda ログへ次の形式で出力した後、Slack Incoming Webhook へ同じ通知を POST します。未設定の場合は Lambda ログ出力だけで処理を続けます。
+`SLACK_WEBHOOK_URL` が設定されている場合、`_notify_duplicates` は Lambda ログへ次の形式で出力した後、Slack Incoming Webhook へ同じ通知を POST します。未設定の場合は Lambda ログ出力だけで処理を続けます。
 
 ```text
-⚠️ メール重複を検知しました EmailID: 18500638 / 件数: 2 / 検知日時(UTC): ...
+⚠️ メール重複を検知しました
+検知した重複: 1 件
+最多の EmailID: 2 件（EmailID: 900001）
+検知日時: 2026-09-13 19:01:00 JST
 ```
 
-ローカル環境では、起動スクリプトが `SLACK_WEBHOOK_URL` に LocalStack 疑似 Slack API の `always-success` URL を自動設定します。AWS では同じ環境変数へ実際の Webhook URL を渡します。Webhook URL はソースコードへ書かず、Secrets Manager などから渡します。
+`最多の EmailID` の件数は判定に使った `Query` の件数そのもので、直近1時間のローリング値です。`2 件` で止まっていれば二重起動、`3`、`4` と伸びていれば同じ行を送り続けるループ、と通知だけで切り分けられます。
+
+ローカル環境では、起動スクリプトが `SLACK_WEBHOOK_URL` に LocalStack 疑似 Slack API の `always-success` URL を自動設定します。AWS では同じ環境変数へ実際の Webhook URL を渡します。現状のコードは環境変数から直接読み取るため、Secrets Manager や SSM Parameter Store の SecureString へ移す場合は Lambda 側に取得処理の実装が必要です。
 
 ## 入力形式
 
@@ -60,7 +66,7 @@ docker exec localstack awslocal logs filter-log-events \
 
 docker exec localstack awslocal dynamodb query \
   --endpoint-url http://dynamodb:8000 \
-  --table-name mail_duplicate_events \
+  --table-name mail_send_log_events \
   --key-condition-expression 'EmailID = :email_id' \
   --expression-attribute-values '{":email_id":{"S":"900001"}}' \
   --consistent-read
@@ -92,6 +98,16 @@ KEEP_TEST_DATA=1 ./scripts/test-mail-duplicate-detector.sh
 python /workspace/sample/show_mail_duplicate_events.py --email-id '<表示された EmailID>'
 ```
 
+## 同一ファイル内の重複の検証
+
+1つの S3 オブジェクトに同じ `EmailID` を含む行が2つある場合を検証します。同一オブジェクト内の行は同じ Lambda 実行で処理されるため `createdAt` と `sourceKey` が同値になり、ソートキーに行番号が含まれていないと2件目が1件目を上書きして検知できなくなります。その回帰テストです。
+
+```bash
+./scripts/test-mail-duplicate-same-file.sh
+```
+
+件数の確認だけでなく、保存された2件が本当に `createdAt` と `sourceKey` を共有していたことも検証します。これがないと、たまたま時刻がずれた場合に衝突ケースを踏まないまま成功してしまいます。
+
 ## 処理時間のベンチマーク
 
 Fluent Bit が複数ログ行をまとめて 1 件の S3 オブジェクトへ配送する想定で、既定100件の成功ログを処理します。S3 配送から DynamoDB Local へ全件が保存されるまでの時間と、Lambda の `REPORT` 行の `Duration` を表示します。
@@ -120,4 +136,8 @@ RECORD_COUNT=200 DELAY_SECONDS=0.5 ./scripts/test-mail-duplicate-concurrent.sh
 
 ## 意図的に対象外としていること
 
-設計メモに合わせ、Fluent Bit の再送、S3イベントの重複配信、Lambda再試行、複数Lambdaの同時実行による競合は防止しません。これらは将来、S3オブジェクトのバージョンIDやETagを使ったイベント冪等化、DynamoDB条件付き書き込み、通知の冪等化で追加対応できます。
+設計メモに合わせ、Fluent Bit の再送、S3イベントの重複配信、Lambda再試行は防止しません。
+
+**複数 Lambda の同時実行は対象です。** `EmailID` をパーティションキーとするベーステーブルへの強整合読み取りにより、同時に起動した複数の Lambda のいずれかが必ず重複を検知します。ただし双方が検知して通知が2回飛ぶことがあり（ローカル計測で5回中1回）、通知の重複排除は行っていません。
+
+S3イベントの重複配信については、同一オブジェクトの再配信で同じログ行が別レコードとして保存され、そのオブジェクトに含まれる全 `EmailID` が重複と判定されます。対応する場合は、ソートキーから `createdAt` を外して `{sourceKey}#{行番号}` とし（再処理しても同一キーとなり上書きされる）、直近1時間の絞り込みを `createdAt` 属性での比較へ移します。
