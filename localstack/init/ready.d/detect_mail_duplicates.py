@@ -24,7 +24,13 @@ import boto3
 from boto3.dynamodb.conditions import Key
 
 REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
-TABLE_NAME = "mail_send_log_events"
+
+# STGと本番が同一アカウント・同一リージョンにあるため、テーブル名を環境ごとに分ける。
+# AWS 上では必ず環境変数で渡す（stg_mail_send_log_events / prd_mail_send_log_events）。
+# 既定値はローカルサンドボックス専用の名前であり、AWS 上のどの環境にも存在しない。
+# これは意図的である。環境変数が欠けた場合、沈黙して他環境のテーブルへ書き込むのではなく、
+# ResourceNotFoundException で落ちて Errors アラームに乗るようにしている。
+TABLE_NAME = os.environ.get("TABLE_NAME", "mail_send_log_events")
 
 # 判定窓。同一 EmailID がこの範囲に 2 件以上あれば重複とする。
 WINDOW = timedelta(hours=1)
@@ -168,6 +174,13 @@ def _extract_log_records(bucket, key):
             # 元ログの送信時刻。Fluent Bit の date と Laravel 行頭の両方から拾う。
             # 現仕様では判定に使わず保存のみ（判定基準は検知時刻に統一）。
             "logTimestamp": (parsed or {}).get("date") or match["log_timestamp"],
+            # ログを出力したインスタンス。Fluent Bit が付与する instance_id。
+            # S3 キーにホスト識別子が含まれないため、この属性が無いと
+            # 「別インスタンスでの二重起動」か「同一インスタンスでの二重送信」かを
+            # 事後に切り分けられない。根本原因の調査で直接必要になる情報である。
+            "sourceHost": ((parsed or {}).get("instance_id")
+                           or (parsed or {}).get("hostname")
+                           or (parsed or {}).get("host")),
         }
 
 
@@ -216,6 +229,8 @@ def _build_item(bucket, key, log_record, created_at):
     }
     if log_record["logTimestamp"]:
         item["logTimestamp"] = log_record["logTimestamp"]
+    if log_record["sourceHost"]:
+        item["sourceHost"] = log_record["sourceHost"]
     return item
 
 
