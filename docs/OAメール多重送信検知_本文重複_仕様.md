@@ -401,6 +401,21 @@ private function createLog($email, $log_message, $type, $add_to_errnotif = true)
     ];
 ```
 
+### 修正するのは2ファイルだけでよい
+
+同じ `createLog()` は `SendEmails.php:358` にも存在し、Lambda の正規表現も `SendEmails` を受け付ける（「1. 入口：ログ行を拾うか」の 1-3）。**それでも修正対象は `EvenSendEmails` / `OddSendEmails` の2ファイルとする。**
+
+| コマンド | ファイル | スケジュール | 修正 |
+| --- | --- | --- | --- |
+| `send_even_emails` | `EvenSendEmails.php:378` | `Kernel.php` に登録済み | **する** |
+| `send_odd_emails` | `OddSendEmails.php:378` | `Kernel.php` に登録済み | **する** |
+| `send_emails` | `SendEmails.php:358` | **登録されていない**（`$commands` にあるのみ） | しない |
+| — | `OldSendEmails.php` | 登録されていない | しない |
+
+`send_emails` は定期実行されておらず、手動でしか動かない。
+
+> **ただし手で流された場合、そのぶんは検知されない。** `content_hash` を持たないログが出るため、Lambda は EmailID の重複しか見られない。運用で `send_emails` を使う機会が生じたら、そのときに同じ修正を入れる。
+
 ### 命名
 
 **追加する項目名は、由来となるカラム名に揃える。**
@@ -498,6 +513,37 @@ $body = preg_replace('/email_id=\d+/', 'email_id=', (string) $email->content) ??
 | Lambda | **不要。** 検知側はハッシュを比較するだけで、計算しない |
 
 **Lambda に鍵を渡す必要はない。** アプリ側が計算した値をそのまま突き合わせるだけである。Lambda の環境変数に鍵を追加する作業は発生しない。
+
+#### 追加するファイル
+
+`config/mail_dup.php` を新規に作成する。
+
+```php
+<?php
+
+return [
+    /*
+     * メール多重送信検知のログに出すハッシュの HMAC 鍵。
+     * EvenSendEmails / OddSendEmails の createLog() から参照する。
+     * 全ワーカーで同一の値を設定すること。
+     */
+    'hash_key' => env('MAIL_DUP_HASH_KEY', ''),
+];
+```
+
+環境変数は各ワーカーに次を追加する。
+
+```
+MAIL_DUP_HASH_KEY=<32文字以上のランダム文字列>
+```
+
+値の生成例。
+
+```bash
+openssl rand -hex 32
+```
+
+> **`env()` を config ファイルの外で呼ばないこと。** `config:cache` を実行すると、config ファイル以外の `env()` は `null` を返す。`createLog()` から直接 `env('MAIL_DUP_HASH_KEY')` を呼ぶと、キャッシュの有無で**ハッシュ値が変わる**。検知が静かに壊れるため、必ず `config('mail_dup.hash_key')` 経由で読む。
 
 #### 満たすべき条件
 
