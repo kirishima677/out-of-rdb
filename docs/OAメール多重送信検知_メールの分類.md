@@ -29,32 +29,48 @@
 
 | グループ | 見分け方 | 件数 | 検知での扱い |
 | --- | --- | --- | --- |
-| **A** | Sending = `Immediately` | 4 | **検知対象外**（ログが出ない） |
+| **A** | 送信ログが出ない | **5** | **検知対象外** |
 | **B** | Creation = `Every 5 mins` | 16 | **鳴らない**（本文が毎回変わる） |
 | **C** | Creation = `Daily` / `Weekly Scheduled` | 3 | 窓の外。**ただし1件は例外** |
-| **D** | Creation = `On Trigger` | 18 | **本来の検知対象** |
+| **D** | Creation = `On Trigger` | **17** | **本来の検知対象** |
 | — | 一覧に記載が無い | 3 | 未確認 |
+
+> **グループAは一覧表の `Immediately` と一致しない。** `1 Minute Interval` と書かれていても、実際には worker を通らない経路がある（下記）。**分類は一覧表ではなく、実際に呼ばれている送信関数で決める。**
 
 ---
 
 ## A：検知対象外（4件）
 
-| Email Type | Target | Creation | Sending |
+| Email Type | Target | 一覧表の Sending | 実際の送信 |
 | --- | --- | --- | --- |
-| New Registration | Alumni/Employee | On Trigger | **Immediately** |
-| **Forgot Password** | Alumni/Employee | On Trigger | **Immediately** |
-| **Forgot Password** | Admin | On Trigger | **Immediately** |
-| Connecting an account | Alumni/Employee | On Trigger | **Immediately** |
+| New Registration | Alumni/Employee | Immediately | 未確認 |
+| **Forgot Password** | Alumni/Employee | Immediately | `ForgotPasswordController:160` の `Mail::send` |
+| **Forgot Password** | Admin | Immediately | `OAResetPassword`（行は `cancelled`） |
+| Connecting an account | Alumni/Employee | Immediately | `ConfirmConnectedAccount:66`（行は `cancelled`） |
+| **Change Email** | **Alumni** | **1 Minute Interval** | **`AlumniController:2284` で行を `sent` にして直接送信** |
 
 **worker（`EvenSendEmails` / `OddSendEmails`）を通らないため、`success sending email:` のログが出ない。**
 何通送られても検知側からは見えない。
 
-コード側でも裏が取れている。
+### 一覧表だけでは判別できない（レビュー指摘 R7）
 
-| 経路 | 状態 |
+最終行の **Change Email（Alumni）は一覧表では `1 Minute Interval`** だが、実際には検知対象外である。
+
+```php
+// app/Http/Controllers/AlumniController.php:2284
+'send_status' => 'sent',          // 作成時点で sent
+...
+\Mail::send('emails.default_no_design', ...)   // :2300 直接送信
+```
+
+**worker は `scheduled` の行しか処理しない。** 作成時点で `sent` になっているため拾われず、送信ログが出ない。DB 上は送信済みに見えるため、テーブルを見ただけでは気づけない。
+
+ログが出ない経路は2種類ある。
+
+| 経路 | 例 |
 | --- | --- |
-| `OAResetPassword` | `emails` に行は作るが `send_status = 'cancelled'`。worker は送らず、Laravel の Notification が直接送信する |
-| `ForgotPasswordController:160` | `Mail::send` で直接送信。`emails` に行を作らない |
+| `emails` に行を作らない | `ForgotPasswordController:160` |
+| 行は作るが worker が拾わない状態で保存 | `cancelled`（`OAResetPassword`、`ConfirmConnectedAccount`）／**`sent`**（`AlumniController::changeEmail()`） |
 
 仮にログが出ていたとしても鳴らない。リセットURLにはワンタイムトークンと `encrypt($email)` が含まれ、**どちらも毎回異なる値**になるためである。
 
@@ -137,7 +153,6 @@
 
 | Email Type | Target | Template |
 | --- | --- | --- |
-| Change Email | Alumni | `change_email` |
 | New Message | Alumni/Employee | `new_dm` |
 | Alumni Invite | Alumni | `generic_notification` |
 | Account Deletion | Alumni/Employee | `generic_notification` |
@@ -155,6 +170,17 @@
 | Poll Answer | Admin | `generic_notification` |
 | New Company Registrant | Other | `prereg_admin_notif` |
 | Company Registration | Other | `prereg_company_notif` |
+
+### 検知できない1件（レビュー指摘 R2）
+
+**Change Email（Admin）は送信ログこそ出るが、本文ハッシュでは検知できない。**
+
+```php
+// app/Http/Controllers/UserController.php:863
+$url = Helpers::frontendUrl("/confirm-new-email?enc_user=".bcrypt($user->id).'&enc_mail='.bcrypt($new_email), 'company');
+```
+
+**`bcrypt()` はソルトが毎回変わるため、同じ入力でも必ず別の文字列になる。** 加えて30分後の有効期限が本文に表示される。正規化の対象にできないので、この経路は EmailID の重複検知だけが有効である。
 
 ### 注意が要る1件
 
