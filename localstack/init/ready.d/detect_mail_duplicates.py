@@ -10,6 +10,12 @@ S3 に保存されたメール送信ログから同一 EmailID の重複送信�
   PK が EmailID なのでベーステーブルを直接 Query でき、ConsistentRead=True を指定できる。
   GSI は仕様上 ConsistentRead を指定できず常に結果整合性のため、判定経路には使わない。
   アプリサーバーが 2〜3 台あり Lambda が同時起動する環境では、これが検知漏れの分かれ目になる。
+
+  検知は 2 種類ある。判定ロジックは共通で、パーティションキーだけが違う。
+    1. 同一 EmailID の再送        PK = EmailID
+    2. 同じ宛先へ同じ本文         PK = "<mail_to_hash>:<content_hash>"
+  2 はアプリがログへ出すハッシュに依存する。ハッシュの無い行では 2 だけを飛ばし、
+  1 は従来どおり動かす。追加機能が既存の検知を巻き込まないようにするため。
 """
 
 import gzip
@@ -32,8 +38,50 @@ REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 # ResourceNotFoundException で落ちて Errors アラームに乗るようにしている。
 TABLE_NAME = os.environ.get("TABLE_NAME", "mail_send_log_events")
 
-# 判定窓。同一 EmailID がこの範囲に 2 件以上あれば重複とする。
-WINDOW = timedelta(hours=1)
+# 本文重複検知のテーブル。既定値の扱いは TABLE_NAME と同じ理由による。
+CONTENT_TABLE_NAME = os.environ.get("CONTENT_TABLE_NAME", "mail_send_log_events_by_content")
+
+
+def _window_minutes():
+    """Return the rolling-window length in minutes, falling back to 60.
+
+    判定窓の長さ（分）を返す。不正な値なら既定の 60 に落とす。
+    """
+    raw = os.environ.get("WINDOW_MINUTES", "").strip()
+    if not raw:
+        return 60
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"WINDOW_MINUTES is not a number ({raw!r}); falling back to 60.")
+        return 60
+    # 24 時間以上に広げると、日次の登録リマインドが全件誤検知になる（仕様の前提条件3）。
+    if not 1 <= value < 1440:
+        print(f"WINDOW_MINUTES out of range ({value}); falling back to 60.")
+        return 60
+    return value
+
+
+# 通知に載せる EmailID の最大件数。超えた分は "..." で省く。
+# 本文の長さを重複の規模によらず一定に保つため。
+NOTIFY_EMAIL_ID_LIMIT = 3
+
+# 判定窓。同じキーがこの範囲に 2 件以上あれば重複とする。
+# 誤検知が多いときに狭められるよう環境変数で変更できる。既定は 1 時間。
+WINDOW = timedelta(minutes=_window_minutes())
+
+# 既知事象の通知抑止。ここに載る subject_hash は保存もカウントもするが Slack へ送らない。
+SUPPRESS_SUBJECT_HASHES = frozenset(
+    part.strip()
+    for part in os.environ.get("SUPPRESS_SUBJECT_HASHES", "").split(",")
+    if part.strip()
+)
+
+# 通知の緊急停止。空でなければ有効。値には理由と日付を入れる運用とする
+# （例: NOTIFY_DISABLED_CONTENT="2026-09-25 頻度調査中"）。
+# 保存とカウントは止めない。止まるのは Slack への送信だけ。
+NOTIFY_DISABLED = bool(os.environ.get("NOTIFY_DISABLED", "").strip())
+NOTIFY_DISABLED_CONTENT = bool(os.environ.get("NOTIFY_DISABLED_CONTENT", "").strip())
 
 # Slack 本文の表示用タイムゾーン。保存は常に UTC。
 DISPLAY_TZ = timezone(timedelta(hours=9), "JST")
@@ -88,10 +136,14 @@ def handler(event, _context):
     # この結果、同一実行で処理した全レコードの createdAt が同値になるため、
     # SK の一意性は sourceKey と sourceLineNumber が担保する（_build_item 参照）。
     now = datetime.now(timezone.utc)
-    table = _get_table()
+    table = _get_table(TABLE_NAME, "EmailID")
+    content_table = _get_table(CONTENT_TABLE_NAME, "mail_to_content_hash")
 
     saved = 0
-    duplicates = {}   # EmailID -> 直近1時間の出現件数
+    content_saved = 0
+    skipped_without_hash = 0
+    seen_email_ids = set()
+    seen_content_keys = {}   # 本文キー -> subject_hash（抑止判定に使う）
 
     for s3_record in event["Records"]:
         bucket = s3_record["s3"]["bucket"]["name"]
@@ -104,26 +156,51 @@ def handler(event, _context):
             continue
 
         for log_record in _extract_log_records(bucket, key):
-            item = _build_item(bucket, key, log_record, now)
-
-            # 先に保存してから数える。ConsistentRead=True により、
-            # 自分が今書いたレコードも、他の Lambda が先に書いたレコードも必ず数に入る。
-            table.put_item(Item=item)
+            # 保存だけを行い、キーを控える。件数は全行を書き終えてから数える。
+            # 行ごとに数えると、同じキーが N 行あるとき 1+2+...+N 件を評価することになり、
+            # 検知したい暴走そのもので読み取り量が行数の二乗に膨らむ。
+            table.put_item(Item=_build_item(bucket, key, log_record, now))
             saved += 1
+            seen_email_ids.add(log_record["EmailID"])
 
-            count = _count_recent(table, item["EmailID"], now)
-            if count >= 2:
-                email_id = item["EmailID"]
-                duplicates[email_id] = max(duplicates.get(email_id, 0), count)
-                print(f"Duplicate detected: EmailID={email_id} count={count}")
+            content_key = _content_key(log_record["context"])
+            if content_key is None:
+                # アプリ変更前の旧ログ、または context JSON が読めなかった行。
+                # EmailID 側の保存は済んでいる。本文テーブルだけを飛ばす。
+                skipped_without_hash += 1
+                continue
 
-    notified = False
-    if duplicates:
-        notified = _notify_duplicates(duplicates, now)
+            content_table.put_item(
+                Item=_build_content_item(bucket, key, log_record, now, content_key)
+            )
+            content_saved += 1
+            seen_content_keys.setdefault(
+                content_key, (log_record["context"] or {}).get("subject_hash")
+            )
+
+    if skipped_without_hash:
+        print(
+            f"Skipped {skipped_without_hash} line(s) without usable hashes; "
+            "content-duplicate detection needs the app-side change."
+        )
+
+    # 全行を保存し終えてから、キーごとに 1 回だけ数える。
+    # ConsistentRead=True により、自分が書いた分も他の Lambda が並行して書いた分も必ず入る。
+    duplicates = _count_duplicates(table, "EmailID", seen_email_ids, now)
+    content_duplicates = _count_duplicates(
+        content_table, "mail_to_content_hash", seen_content_keys, now
+    )
+
+    notified = _notify(
+        duplicates, content_duplicates, seen_content_keys, now, content_table
+    )
 
     return {
         "saved_successful_send_logs": saved,
+        "saved_content_records": content_saved,
+        "skipped_without_hash": skipped_without_hash,
         "duplicate_email_ids": len(duplicates),
+        "duplicate_content_keys": len(content_duplicates),
         "duplicate_notifications": int(notified),
     }
 
@@ -181,7 +258,45 @@ def _extract_log_records(bucket, key):
             "sourceHost": ((parsed or {}).get("instance_id")
                            or (parsed or {}).get("hostname")
                            or (parsed or {}).get("host")),
+            # メッセージ部の後ろに付く Laravel の context JSON。ハッシュはここに入る。
+            # アプリ変更前のログには存在しないため None になりうる。
+            "context": _parse_log_context(log_line, match.end()),
         }
+
+
+def _parse_log_context(log_line, start_at):
+    """Return the Laravel context JSON appended after the message, or None.
+
+    メッセージ部の後ろに付く Laravel の context JSON を返す。読めなければ None。
+    """
+    # 検索の起点をマッチ末尾にするのは、メッセージ部に "{" が現れても拾わないため。
+    start = log_line.find("{", start_at)
+    if start < 0:
+        return None
+    try:
+        # raw_decode は先頭の 1 値だけを読む。Monolog が context の後ろに extra を
+        # 付ける形式でも、末尾に空白が残る形でも失敗しない。
+        value, _ = json.JSONDecoder().raw_decode(log_line[start:])
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _content_key(context):
+    """Return the content-table partition key, or None when hashes are missing.
+
+    本文テーブルのパーティションキーを返す。ハッシュが揃わなければ None。
+    """
+    if not context:
+        return None
+    mail_to_hash = context.get("mail_to_hash")
+    content_hash = context.get("content_hash")
+    # 片方でも欠けたら判定できない。空文字も同様に扱う。
+    if not isinstance(mail_to_hash, str) or not mail_to_hash:
+        return None
+    if not isinstance(content_hash, str) or not content_hash:
+        return None
+    return f"{mail_to_hash}:{content_hash}"
 
 
 def _unwrap_json_log(line):
@@ -234,27 +349,106 @@ def _build_item(bucket, key, log_record, created_at):
     return item
 
 
-def _count_recent(table, email_id, now):
-    """Count records for this EmailID inside the rolling window.
+def _build_content_item(bucket, key, log_record, created_at, content_key):
+    """Build the content-table record for one log line.
 
-    直近1時間に含まれる、この EmailID のレコード件数を数える。
+    本文テーブル用のレコードを 1 件作る。
+    """
+    # ソートキー・TTL・原本への辿り方は EmailID 側とまったく同じでよいので作り直さない。
+    # 違うのはパーティションキーだけである。
+    item = _build_item(bucket, key, log_record, created_at)
+    del item["EmailID"]
+    item["mail_to_content_hash"] = content_key
+
+    # EmailID はキーではなく通常属性として持つ。本文キーだけでは元のメールに戻れないため。
+    item["emailId"] = log_record["EmailID"]
+
+    context = log_record["context"] or {}
+    for attribute, field in (
+        ("subjectHash", "subject_hash"),   # 既知事象の通知抑止に使う
+        ("company", "company"),            # 通知に影響範囲を出すため
+        ("language", "language"),          # 同じ通知で本文ハッシュが違う理由の説明
+        ("appCreatedAt", "created_at"),    # emails 行の作成時刻。createdAt(処理時刻)とは別物
+    ):
+        value = context.get(field)
+        if isinstance(value, str) and value:
+            item[attribute] = value
+    return item
+
+
+def _count_duplicates(table, key_name, keys, now):
+    """Count each key once and return those at or above the threshold.
+
+    キーごとに 1 回だけ数え、閾値に達したものを返す。
+    """
+    duplicates = {}
+    for key_value in keys:
+        count = _count_recent(table, key_name, key_value, now)
+        if count >= 2:
+            duplicates[key_value] = count
+            print(f"Duplicate detected: {key_name}={key_value} count={count}")
+    return duplicates
+
+
+def _fetch_email_ids(table, key_name, key_value, now, limit):
+    """Return up to `limit` + 1 emailId values for this key, oldest first.
+
+    このキーの emailId を古い順に最大 limit + 1 件返す。
+    """
+    # limit + 1 件取るのは「これ以上あるか」を判断するため。
+    # 全件読むと、暴走で数千件たまっているときに転送量が跳ねる。
+    cutoff = (now - WINDOW).isoformat(timespec="microseconds") + "#"
+    try:
+        response = table.query(
+            KeyConditionExpression=Key(key_name).eq(key_value) & Key("recordKey").gte(cutoff),
+            ConsistentRead=True,
+            # ソートキーの先頭が createdAt なので、昇順は「先に検知された順」になる。
+            ScanIndexForward=True,
+            Limit=limit + 1,
+            ProjectionExpression="emailId",
+        )
+    except Exception as exc:
+        # 通知を飾るための情報であり、取れなくても検知は成立する。
+        # ここで落として通知そのものを失うほうが損失が大きい。
+        print(f"Could not read emailIds for {key_value}: {exc}")
+        return []
+    return [item["emailId"] for item in response.get("Items", []) if "emailId" in item]
+
+
+def _format_email_ids(email_ids, limit):
+    """Join ids for the message, marking that more exist.
+
+    通知用に並べる。上限を超える場合は省略されていることを示す。
+    """
+    if not email_ids:
+        return ""
+    shown = ", ".join(email_ids[:limit])
+    return f"{shown}, ..." if len(email_ids) > limit else shown
+
+
+def _count_recent(table, key_name, key_value, now):
+    """Count records for this key inside the rolling window.
+
+    判定窓に含まれる、このキーのレコード件数を数える。
     """
     # SK の先頭が createdAt なので、文字列の範囲比較がそのまま時刻の絞り込みになる。
     # 末尾の "#" は境界の意図を明示するための区切り。
     cutoff = (now - WINDOW).isoformat(timespec="microseconds") + "#"
 
     # ConsistentRead=True はベーステーブルの主キー経由でのみ指定できる。
-    # PK を EmailID にしているからこそ使えて、書き込み直後のレコードが必ず数に入る。
+    # 判定キーをそのまま PK にしているからこそ使えて、書き込み直後のレコードが必ず数に入る。
     # Select="COUNT" は件数だけを返すので本文の転送が発生しない。
     kwargs = {
-        "KeyConditionExpression": Key("EmailID").eq(email_id) & Key("recordKey").gte(cutoff),
+        "KeyConditionExpression": Key(key_name).eq(key_value) & Key("recordKey").gte(cutoff),
         "ConsistentRead": True,
         "Select": "COUNT",
     }
 
     # Query は 1 回で最大 1MB 分しか評価せず、超過分はエラーではなく
-    # LastEvaluatedKey として持ち越される。暴走ループで単一 EmailID の
+    # LastEvaluatedKey として持ち越される。暴走ループで単一キーの
     # レコードが大量になったとき件数が過少になるため、全ページ読み切る。
+    # Select="COUNT" でも読み取り容量は実アイテムを読む場合と同じである。
+    # 減るのは転送量だけで、RCU は減らない。
     total = 0
     while True:
         response = table.query(**kwargs)
@@ -265,7 +459,7 @@ def _count_recent(table, email_id, now):
         kwargs["ExclusiveStartKey"] = start_key
 
 
-def _get_table():
+def _get_table(table_name, key_name):
     """Return the table, bootstrapping it only when running against LocalStack.
 
     テーブルを返す。LocalStack 向けのときだけ自動作成する。
@@ -278,11 +472,11 @@ def _get_table():
     #      dynamodb:UpdateTimeToLive という、本来不要な権限が必要になる
     # 本番で必要な権限は dynamodb:PutItem と dynamodb:Query の 2 つだけで済む。
     if not os.environ.get("DYNAMODB_ENDPOINT"):
-        return DYNAMODB.Table(TABLE_NAME)
-    return _bootstrap_local_table()
+        return DYNAMODB.Table(table_name)
+    return _bootstrap_local_table(table_name, key_name)
 
 
-def _bootstrap_local_table():
+def _bootstrap_local_table(table_name, key_name):
     """Create the composite-key table for local development only.
 
     ローカル開発用にのみ、複合キーのテーブルを作成する。
@@ -291,49 +485,108 @@ def _bootstrap_local_table():
     # ACTIVE 前に返るため、直後の put_item が失敗し得る点にも注意。
     try:
         table = DYNAMODB.create_table(
-            TableName=TABLE_NAME,
+            TableName=table_name,
             KeySchema=[
-                {"AttributeName": "EmailID", "KeyType": "HASH"},
+                {"AttributeName": key_name, "KeyType": "HASH"},
                 {"AttributeName": "recordKey", "KeyType": "RANGE"},
             ],
             AttributeDefinitions=[
-                {"AttributeName": "EmailID", "AttributeType": "S"},
+                {"AttributeName": key_name, "AttributeType": "S"},
                 {"AttributeName": "recordKey", "AttributeType": "S"},
             ],
             BillingMode="PAY_PER_REQUEST",
         )
         table.wait_until_exists()
     except DYNAMODB.meta.client.exceptions.ResourceInUseException:
-        return DYNAMODB.Table(TABLE_NAME)
+        return DYNAMODB.Table(table_name)
 
     # TTL はストレージ掃除のみを担う。削除は非同期で最大 48 時間遅れることがあるため、
     # 1 時間の判定は TTL ではなく _count_recent の時刻条件で行う。
     client = DYNAMODB.meta.client
-    status = client.describe_time_to_live(TableName=TABLE_NAME)["TimeToLiveDescription"]
+    status = client.describe_time_to_live(TableName=table_name)["TimeToLiveDescription"]
     if status.get("TimeToLiveStatus") != "ENABLED":
         client.update_time_to_live(
-            TableName=TABLE_NAME,
+            TableName=table_name,
             TimeToLiveSpecification={"Enabled": True, "AttributeName": "expiresAt"},
         )
     return table
 
 
-def _notify_duplicates(duplicates, now):
-    """Notify Slack with the duplicate scale only; IDs are not enumerated.
+def _notify(duplicates, content_duplicates, subject_hashes, now, content_table):
+    """Decide whether to notify, then send at most one message.
 
-    個別 EmailID を列挙せず、重複の規模だけを Slack へ通知する。
+    通知するかを判断し、送るなら 1 回だけ送る。
     """
-    # 通知本文の長さを重複件数によらず一定にするため、個別 EmailID は列挙しない。
-    # 「最多の EmailID」の件数は _count_recent の戻り値そのもので、
-    # 直近1時間のローリング件数を表す（集計のための追加検索はしない）。
-    top_id, top_count = max(duplicates.items(), key=lambda item: item[1])
-    message = (
-        "⚠️ メール重複を検知しました\n"
-        f"検知した重複: {len(duplicates)} 件\n"
-        f"最多の EmailID: {top_count} 件（EmailID: {top_id}）\n"
-        f"検知日時: {now.astimezone(DISPLAY_TZ):%Y-%m-%d %H:%M:%S} JST"
+    # 停止しても保存とカウントは済んでいる。解除後に DynamoDB から遡って数えられる。
+    if NOTIFY_DISABLED:
+        if duplicates or content_duplicates:
+            print(
+                "MAIL_DUPLICATE_NOTIFY_DISABLED all "
+                f"emailIdKeys={len(duplicates)} contentKeys={len(content_duplicates)}"
+            )
+        return False
+
+    # 抑止リストの件名は保存・カウント・ログを通常どおり行い、Slack へ送る段階だけで落とす。
+    # 除外ではなく抑止にしているのは、修正されたことを記録側で確認したいため。
+    notifiable_content = {}
+    for content_key, count in content_duplicates.items():
+        subject_hash = subject_hashes.get(content_key)
+        if subject_hash and subject_hash in SUPPRESS_SUBJECT_HASHES:
+            print(
+                f"MAIL_DUPLICATE_SUPPRESSED known-issue subject={subject_hash} count={count}"
+            )
+            continue
+        notifiable_content[content_key] = count
+
+    if NOTIFY_DISABLED_CONTENT and notifiable_content:
+        # 本文重複だけを止める。実績のある EmailID 検知は道連れにしない。
+        print(
+            "MAIL_DUPLICATE_NOTIFY_DISABLED content "
+            f"contentKeys={len(notifiable_content)}"
+        )
+        notifiable_content = {}
+
+    if not duplicates and not notifiable_content:
+        return False
+
+    return _post_to_slack(
+        _build_message(duplicates, notifiable_content, now, content_table)
     )
-    return _post_to_slack(message)
+
+
+def _build_message(duplicates, content_duplicates, now, content_table):
+    """Build one Slack message covering both kinds of duplicate.
+
+    2 種類の重複をまとめた Slack 本文を 1 通ぶん作る。
+    """
+    # 本文の長さを件数によらず一定にするため、個別のキーは列挙しない。
+    # 件数は _count_recent の戻り値そのもので、判定窓のローリング件数を表す。
+    lines = ["⚠️ メール重複を検知しました"]
+
+    if duplicates:
+        top_id, top_count = max(duplicates.items(), key=lambda item: item[1])
+        lines.append(f"[同一メールの再送] 検知した重複: {len(duplicates)} 件")
+        lines.append(f"　最多の EmailID: {top_count} 件（EmailID: {top_id}）")
+
+    if content_duplicates:
+        top_key, top_count = max(content_duplicates.items(), key=lambda item: item[1])
+        lines.append(f"[同じ宛先へ同じ内容] 検知した組み合わせ: {len(content_duplicates)} 件")
+
+        # 最多のキーについてだけ EmailID を引く。調査の入口を1つ渡すのが目的で、
+        # 全件を並べる必要はない。件数に関わらず問い合わせは 1 回に収まる。
+        email_ids = _format_email_ids(
+            _fetch_email_ids(
+                content_table, "mail_to_content_hash", top_key, now, NOTIFY_EMAIL_ID_LIMIT
+            ),
+            NOTIFY_EMAIL_ID_LIMIT,
+        )
+        if email_ids:
+            lines.append(f"　最多: {top_count} 通（EmailID: {email_ids}）")
+        else:
+            lines.append(f"　最多: {top_count} 通")
+
+    lines.append(f"検知日時: {now.astimezone(DISPLAY_TZ):%Y-%m-%d %H:%M:%S} JST")
+    return "\n".join(lines)
 
 
 def _post_to_slack(message):
